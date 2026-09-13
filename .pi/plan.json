@@ -1,0 +1,22 @@
+{
+  "planner": {
+    "claudeBin": "claude",
+    "model": "fable",
+    "effort": "medium",
+    "maxBudgetUsd": 3
+  },
+  "implementer": {
+    "model": "lmstudio/qwen/qwen3.8-27b"
+  },
+  "providers": {
+    "lmstudio": {
+      "baseUrl": "http://127.0.0.1:1234/v1",
+      "api": "openai-completions",
+      "apiKey": "lmstudio",
+      "compat": { "supportsDeveloperRole": false, "supportsReasoningEffort": false },
+      "models": [
+        { "id": "qwen/qwen3.8-27b", "name": "qwen-local", "input": ["text", "image"], "contextWindow": 262144, "maxTokens": 32768 }
+      ]
+    }
+  }
+}

@@ -1,0 +1,5 @@
+# plans are working files, not source
+.plan/
+# per-machine overrides (Claude login profile, local model, binary path)
+.pi/plan.local.json
+node_modules/

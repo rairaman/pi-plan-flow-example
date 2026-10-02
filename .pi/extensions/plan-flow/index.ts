@@ -22,6 +22,8 @@ const CONFIG_FILES = ["plan.json", "plan.local.json"]; // later files override e
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 const DEFAULT_EFFORT = "medium";
 const FLAGS: Record<string, keyof PlannerConfig> = { "--model": "model", "--effort": "effort", "--budget": "maxBudgetUsd" };
+const PICK = "?"; // `--model ?` (or a configured model of "?") opens a picker
+const CLAUDE_MODELS = ["fable", "opus", "sonnet", "haiku"]; // Claude Code aliases offered by the /plan picker
 
 interface PlannerConfig {
   claudeBin?: string; // default "claude", resolved on PATH
@@ -101,14 +103,30 @@ function slugFromArg(arg: string): string {
   return arg.trim().replace(/^\.plan\//, "").replace(/\.md$/, "");
 }
 
+// Splits leading `--flag value` pairs from the rest of the arguments.
+function parseFlags(args: string, known: string[]): { flags: Record<string, string>; rest: string } {
+  const words = args.trim().split(/\s+/).filter(Boolean);
+  const flags: Record<string, string> = {};
+  while (words.length > 0 && words[0].startsWith("--")) {
+    if (!known.includes(words[0])) throw new Error(`Unknown flag ${words[0]}. Known flags: ${known.join(", ")}`);
+    if (words.length < 2) throw new Error(`${words[0]} needs a value`);
+    flags[words[0]] = words[1];
+    words.splice(0, 2);
+  }
+  return { flags, rest: words.join(" ") };
+}
+
+// Default first, no duplicates, no PICK placeholder.
+function pickOptions(...lists: (string | undefined)[][]): string[] {
+  return [...new Set(lists.flat())].filter((o): o is string => !!o && o !== PICK);
+}
+
 // Leading `--flag value` pairs override planner config for this run; the rest is the task.
 function parsePlanArgs(args: string): { overrides: PlannerConfig; task: string } {
-  const words = args.trim().split(/\s+/).filter(Boolean);
+  const { flags, rest } = parseFlags(args, Object.keys(FLAGS));
   const overrides: Record<string, string | number> = {};
-  while (words.length >= 2 && words[0].startsWith("--")) {
-    const key = FLAGS[words[0]];
-    if (!key) throw new Error(`Unknown flag ${words[0]}. Known flags: ${Object.keys(FLAGS).join(", ")}`);
-    const value = words[1];
+  for (const [flag, value] of Object.entries(flags)) {
+    const key = FLAGS[flag];
     if (key === "maxBudgetUsd") {
       const n = Number(value);
       if (!Number.isFinite(n) || n <= 0) throw new Error(`--budget needs a positive number, got "${value}"`);
@@ -116,9 +134,8 @@ function parsePlanArgs(args: string): { overrides: PlannerConfig; task: string }
     } else {
       overrides[key] = value;
     }
-    words.splice(0, 2);
   }
-  return { overrides: overrides as PlannerConfig, task: words.join(" ") };
+  return { overrides: overrides as PlannerConfig, task: rest };
 }
 
 // Prefer the PLAN_FILE line from Claude's final message; fall back to the newest new/changed plan.
@@ -139,7 +156,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.registerCommand("plan", {
-    description: "Plan a feature with Claude Code and write it to .plan/ (flags: --model, --effort, --budget)",
+    description: "Plan a feature with Claude Code and write it to .plan/ (flags: --model <m|?>, --effort, --budget)",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       if (loadError) ctx.ui.notify(`plan-flow config problem at startup: ${loadError}`, "warning");
       if (running) {
@@ -161,12 +178,14 @@ export default function (pi: ExtensionAPI) {
       let task: string;
       let instructions: string;
       let configDir: string | undefined;
+      let configuredModel: string | undefined;
       try {
         const cfg = loadConfig();
         const parsed = parsePlanArgs(args);
         task = parsed.task;
+        configuredModel = cfg.planner?.model;
         planner = { ...cfg.planner, ...parsed.overrides };
-        if (!task) throw new Error("Usage: /plan [--model <m>] [--effort <e>] [--budget <usd>] <what you want built>");
+        if (!task) throw new Error("Usage: /plan [--model <m|?>] [--effort <e>] [--budget <usd>] <what you want built>");
         if (!planner.model) throw new Error("No planner model. Set planner.model in .pi/plan.json or pass --model.");
         planner.effort ??= DEFAULT_EFFORT;
         if (!EFFORTS.includes(planner.effort)) throw new Error(`effort must be one of ${EFFORTS.join(", ")}, got "${planner.effort}"`);
@@ -176,6 +195,12 @@ export default function (pi: ExtensionAPI) {
       } catch (e) {
         ctx.ui.notify((e as Error).message, "error");
         return;
+      }
+
+      if (planner.model === PICK) {
+        const picked = await ctx.ui.select("Plan with which Claude model?", pickOptions([configuredModel], CLAUDE_MODELS));
+        if (!picked) return;
+        planner.model = picked;
       }
 
       const bin = planner.claudeBin ? expandHome(planner.claudeBin) : "claude";
@@ -280,20 +305,31 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("implement", {
-    description: "Implement a plan from .plan/ with the configured implementer model (switches model if needed)",
+    description: "Implement a plan from .plan/ with the implementer model (flags: --model <provider/id|?>; switches model if needed)",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       if (loadError) ctx.ui.notify(`plan-flow config problem at startup: ${loadError}`, "warning");
       let want: string;
+      let configuredModel: string | undefined;
+      let slugArg: string;
       try {
-        want = loadConfig().implementer?.model ?? "";
-        if (!want.includes("/")) throw new Error('No implementer model. Set implementer.model in .pi/plan.json as "provider/model-id".');
+        const { flags, rest } = parseFlags(args, ["--model"]);
+        slugArg = rest;
+        configuredModel = loadConfig().implementer?.model;
+        want = flags["--model"] ?? configuredModel ?? "";
+        if (want !== PICK && !want.includes("/")) {
+          throw new Error(
+            flags["--model"]
+              ? `--model needs "provider/model-id" or "?", got "${want}"`
+              : 'No implementer model. Set implementer.model in .pi/plan.json as "provider/model-id", or pass --model.',
+          );
+        }
       } catch (e) {
         ctx.ui.notify((e as Error).message, "error");
         return;
       }
 
       // Pick the plan.
-      let slug = args.trim() ? slugFromArg(args) : undefined;
+      let slug = slugArg ? slugFromArg(slugArg) : undefined;
       const plans = listPlans();
       if (!slug) {
         if (plans.length === 0) {
@@ -306,6 +342,18 @@ export default function (pi: ExtensionAPI) {
       if (!existsSync(join(PROJECT_ROOT, PLAN_DIR, `${slug}.md`))) {
         ctx.ui.notify(`No such plan: ${PLAN_DIR}/${slug}.md`, "error");
         return;
+      }
+
+      if (want === PICK) {
+        const available = ctx.modelRegistry.getAvailable().map((m) => `${m.provider}/${m.id}`);
+        const options = pickOptions([configuredModel], available);
+        if (options.length === 0) {
+          ctx.ui.notify("No models available. Log in with /login or add providers to .pi/plan.json.", "error");
+          return;
+        }
+        const picked = await ctx.ui.select("Implement with which model?", options);
+        if (!picked) return;
+        want = picked;
       }
 
       // Make sure pi is on the implementer model.

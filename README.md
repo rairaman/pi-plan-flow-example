@@ -51,16 +51,20 @@ Per-run overrides go in front of the task:
 
 | Flag | Meaning |
 |---|---|
-| `--model` | Claude model alias or id passed to `claude --model` |
+| `--model` | Claude model alias or id passed to `claude --model`. `?` opens a picker (`fable`, `opus`, `sonnet`, `haiku`, with your default first). |
 | `--effort` | `low`, `medium`, `high`, `xhigh`, or `max`. Lower is cheaper and faster. |
 | `--budget` | Hard stop in USD, based on Claude's own cost estimate. Not a bill on a subscription, but proportional to usage. |
 
 Then:
 
 ```
-/implement            # picks the only plan, or offers a list
-/implement my-slug    # a specific plan
+/implement                                   # picks the only plan, or offers a list
+/implement my-slug                           # a specific plan
+/implement --model openai/gpt-5-mini my-slug # a different implementer for this run
+/implement --model ? my-slug                 # pick from the models pi can use
 ```
+
+`--model` overrides `implementer.model` for one run. It takes `provider/model-id`, the same form as the config.
 
 `/plan-cancel` stops a running plan. A partial plan file, if any, is left in `.plan/`.
 
@@ -72,10 +76,10 @@ Then:
 |---|---|
 | `planner.claudeBin` | Path or name of the `claude` binary. Default `claude`. |
 | `planner.claudeConfigDir` | `CLAUDE_CONFIG_DIR` for the spawned Claude, for people with several logins. Unset uses `~/.claude`. |
-| `planner.model` | Default planning model. |
+| `planner.model` | Default planning model. Set it to `"?"` to be asked every time. |
 | `planner.effort` | Default effort. `medium` if unset. |
 | `planner.maxBudgetUsd` | Default budget cap. Omit for none. |
-| `implementer.model` | `provider/model-id` pi switches to for `/implement`. |
+| `implementer.model` | `provider/model-id` pi switches to for `/implement`. `"?"` asks every time. |
 | `providers` | Extra providers for pi, same shape as `~/.pi/agent/models.json`. Registered at startup so cloners need no global config. |
 
 `.pi/settings.json` sets the model pi starts on. Keep it in line with `implementer.model`.

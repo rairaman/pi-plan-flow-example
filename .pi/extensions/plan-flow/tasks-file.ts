@@ -1,5 +1,5 @@
 // tasks.json: the machine-readable half of a plan. The planner writes it; validation runs before approval.
-import { ID_PATTERN, branchFor } from "./ids";
+import { ID_PATTERN, branchFor } from "./ids.ts";
 
 export interface TaskSpec {
   id: string; // "<epic>.<n>"

@@ -4,10 +4,11 @@ import { mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import type { TasksFile } from "./tasks-file";
+import type { TasksFile } from "./tasks-file.ts";
 
 export type EpicStatus =
   | "planning" | "draft" | "failed" | "cancelled" | "approved" | "waiting" | "running" | "in_review" | "merged" | "blocked";
+export type TaskStatus = "open" | "claimed" | "done" | "needs_replan";
 export type RunRole = "planner" | "worker" | "check" | "replan";
 export type RunOutcome = "running" | "success" | "error" | "cancelled" | "abandoned";
 
@@ -23,6 +24,20 @@ export interface EpicRow {
   status: EpicStatus;
   created_at: number;
   updated_at: number;
+  runner_pid: number | null; // process running this feature's tasks, while status is running
+  pr_url: string | null;
+}
+
+export interface TaskRow {
+  id: string;
+  epic: string;
+  seq: number;
+  title: string;
+  status: TaskStatus;
+  attempts: number;
+  claimed_by: string | null; // "pid:<n>"
+  claimed_at: number | null;
+  last_error: string | null;
 }
 
 export interface RunRow {
@@ -57,6 +72,7 @@ export interface EpicSummary {
   status: EpicStatus;
   created_at: number;
   task_count: number;
+  tasks_done: number;
   run_count: number;
   duration_ms: number;
   input_tokens: number;
@@ -91,8 +107,8 @@ export interface RunFinish {
   costUsd?: number;
 }
 
-const SCHEMA_VERSION = 1;
-const SCHEMA = `
+const SCHEMA_VERSION = 2;
+const SCHEMA_V1 = `
 CREATE TABLE epics (
   id TEXT PRIMARY KEY,
   slug TEXT NOT NULL,
@@ -152,6 +168,12 @@ CREATE TABLE runs (
 );
 CREATE INDEX runs_epic ON runs(epic);
 `;
+// v2: the runner.
+const SCHEMA_V2 = `
+ALTER TABLE epics ADD COLUMN runner_pid INTEGER;
+ALTER TABLE epics ADD COLUMN pr_url TEXT;
+`;
+const MIGRATIONS = [SCHEMA_V1, SCHEMA_V2]; // MIGRATIONS[n] takes user_version n to n + 1
 
 // node:sqlite prints an ExperimentalWarning on first load; keep that one out of pi's terminal.
 function loadSqlite(): typeof import("node:sqlite") {
@@ -179,10 +201,13 @@ export function pidAlive(pid: number): boolean {
 }
 
 export class Store {
-  constructor(
-    readonly db: DatabaseSync,
-    private readonly now: () => number = Date.now,
-  ) {}
+  readonly db: DatabaseSync;
+  private readonly now: () => number;
+
+  constructor(db: DatabaseSync, now: () => number = Date.now) {
+    this.db = db;
+    this.now = now;
+  }
 
   close(): void {
     if (this.db.isOpen) this.db.close();
@@ -300,6 +325,7 @@ export class Store {
       .prepare(
         `SELECT e.id, e.slug, e.title, e.status, e.created_at,
            (SELECT count(*) FROM tasks t WHERE t.epic = e.id) AS task_count,
+           (SELECT count(*) FROM tasks t WHERE t.epic = e.id AND t.status = 'done') AS tasks_done,
            count(r.id) AS run_count,
            coalesce(sum(r.duration_ms), 0) AS duration_ms,
            coalesce(sum(r.input_tokens), 0) AS input_tokens,
@@ -312,6 +338,109 @@ export class Store {
          ORDER BY e.created_at DESC, e.id`,
       )
       .all() as unknown as EpicSummary[];
+  }
+
+  // --- runner -------------------------------------------------------------------------------------
+
+  // Take the runner lock for a feature: it must be approved or blocked, or running under a process that has died.
+  lockEpic(id: string, pid: number = process.pid, isAlive: (pid: number) => boolean = pidAlive): { ok: true } | { ok: false; reason: string } {
+    return this.transaction(() => {
+      const e = this.epic(id);
+      if (!e) return { ok: false, reason: `Unknown plan ${id}` };
+      const free = e.status === "approved" || e.status === "blocked" || (e.status === "running" && (e.runner_pid == null || !isAlive(e.runner_pid)));
+      if (!free) {
+        const why = e.status === "running" ? `already running (pid ${e.runner_pid})` : `${e.status}; only approved or blocked plans can run`;
+        return { ok: false, reason: `${e.dir} is ${why}` };
+      }
+      this.db.prepare("UPDATE epics SET status = 'running', runner_pid = ?, updated_at = ? WHERE id = ?").run(pid, this.now(), id);
+      return { ok: true };
+    });
+  }
+
+  releaseEpic(id: string, status: EpicStatus): void {
+    this.db.prepare("UPDATE epics SET status = ?, runner_pid = NULL, updated_at = ? WHERE id = ?").run(status, this.now(), id);
+  }
+
+  setPrUrl(id: string, url: string): void {
+    this.db.prepare("UPDATE epics SET pr_url = ?, updated_at = ? WHERE id = ?").run(url, this.now(), id);
+  }
+
+  tasks(epic: string): TaskRow[] {
+    return this.db.prepare("SELECT * FROM tasks WHERE epic = ? ORDER BY seq").all(epic) as unknown as TaskRow[];
+  }
+
+  task(id: string): TaskRow | undefined {
+    return this.db.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as TaskRow | undefined;
+  }
+
+  // The next ready task (open, every dependency done, lowest seq), claimed atomically. Undefined when none is ready.
+  claimNextTask(epic: string, pid: number = process.pid): TaskRow | undefined {
+    return this.transaction(() => {
+      const next = this.db
+        .prepare(
+          `SELECT t.id FROM tasks t
+           WHERE t.epic = ? AND t.status = 'open'
+             AND NOT EXISTS (SELECT 1 FROM deps d JOIN tasks b ON b.id = d.blocker WHERE d.task = t.id AND b.status <> 'done')
+           ORDER BY t.seq LIMIT 1`,
+        )
+        .get(epic) as { id: string } | undefined;
+      if (!next) return undefined;
+      const res = this.db
+        .prepare("UPDATE tasks SET status = 'claimed', claimed_by = ?, claimed_at = ?, attempts = attempts + 1 WHERE id = ? AND status = 'open'")
+        .run(`pid:${pid}`, this.now(), next.id);
+      return res.changes === 1 ? this.task(next.id) : undefined;
+    });
+  }
+
+  completeTask(id: string): void {
+    this.db.prepare("UPDATE tasks SET status = 'done', claimed_by = NULL, last_error = NULL WHERE id = ?").run(id);
+  }
+
+  // Record a failed attempt. The task goes back to open, or to needs_replan once it has used maxAttempts.
+  failTask(id: string, error: string, maxAttempts: number): TaskStatus {
+    const t = this.task(id);
+    if (!t) throw new Error(`Unknown task ${id}`);
+    const status: TaskStatus = t.attempts >= maxAttempts ? "needs_replan" : "open";
+    this.db.prepare("UPDATE tasks SET status = ?, claimed_by = NULL, last_error = ? WHERE id = ?").run(status, error, id);
+    return status;
+  }
+
+  // Claims left by a runner that died. The interrupted attempt doesn't count. Returns the task ids reset.
+  resetDeadClaims(epic: string, isAlive: (pid: number) => boolean = pidAlive): string[] {
+    const reset: string[] = [];
+    for (const t of this.tasks(epic)) {
+      if (t.status !== "claimed") continue;
+      const pid = Number(t.claimed_by?.replace(/^pid:/, ""));
+      if (Number.isFinite(pid) && pid > 0 && isAlive(pid)) continue;
+      this.db.prepare("UPDATE tasks SET status = 'open', claimed_by = NULL, attempts = max(attempts - 1, 0) WHERE id = ?").run(t.id);
+      reset.push(t.id);
+    }
+    return reset;
+  }
+
+  // Give tasks that ran out of attempts a fresh start. Their last error is kept for the next prompt.
+  resetBlockedTasks(epic: string): string[] {
+    const ids = this.tasks(epic).filter((t) => t.status === "needs_replan").map((t) => t.id);
+    this.db.prepare("UPDATE tasks SET status = 'open', attempts = 0 WHERE epic = ? AND status = 'needs_replan'").run(epic);
+    return ids;
+  }
+
+  taskProgress(epic: string): { done: number; total: number } {
+    return this.db
+      .prepare("SELECT count(*) AS total, coalesce(sum(status = 'done'), 0) AS done FROM tasks WHERE epic = ?")
+      .get(epic) as { done: number; total: number };
+  }
+
+  private transaction<T>(fn: () => T): T {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const out = fn();
+      this.db.exec("COMMIT");
+      return out;
+    } catch (e) {
+      this.db.exec("ROLLBACK");
+      throw e;
+    }
   }
 }
 
@@ -327,11 +456,17 @@ export function openStore(path: string, now?: () => number): Store {
     db.close();
     throw new Error(`${path} has schema version ${user_version}, newer than this plan-flow (${SCHEMA_VERSION}). Update the extension.`);
   }
-  if (user_version < 1) {
+  for (let v = user_version; v < SCHEMA_VERSION; v++) {
     db.exec("BEGIN IMMEDIATE");
-    db.exec(SCHEMA);
-    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-    db.exec("COMMIT");
+    try {
+      db.exec(MIGRATIONS[v]);
+      db.exec(`PRAGMA user_version = ${v + 1}`);
+      db.exec("COMMIT");
+    } catch (e) {
+      db.exec("ROLLBACK");
+      db.close();
+      throw e;
+    }
   }
   return new Store(db, now);
 }

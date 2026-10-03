@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ID_PATTERN, branchFor, idFromArg, newId, planDirName, slugify } from "../.pi/extensions/plan-flow/ids";
+import { ID_PATTERN, branchFor, idFromArg, newId, planDirName, slugify } from "../.pi/extensions/plan-flow/ids.ts";
 
 describe("newId", () => {
   it("returns 4 base36 characters", () => {

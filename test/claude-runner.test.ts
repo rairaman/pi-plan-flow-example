@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { parseUsage, runClaude, summarizeToolUse } from "../.pi/extensions/plan-flow/claude-runner";
+import { parseUsage, runClaude, summarizeToolUse } from "../.pi/extensions/plan-flow/claude-runner.ts";
 
 const FAKE = join(__dirname, "fixtures", "fake-claude.mjs");
 const tmp = mkdtempSync(join(tmpdir(), "claude-runner-"));

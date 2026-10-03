@@ -209,7 +209,7 @@ describe("runEpic", () => {
     // task's reset, so it never lands in a commit.
     expect(log(["--name-only", "--format=", "main..HEAD"])).not.toContain("setup-ran.txt");
     const checks = store.runsFor(ID).filter((r) => r.role === "check" && r.task === null);
-    expect(checks.map((r) => r.log_path?.split("/").pop())).toEqual(["setup.log", "final-check.log"]);
+    expect(checks.map((r) => r.log_path)).toEqual([`.plan/logs/${ID}/setup.log`, `.plan/logs/${ID}/final-check.log`]);
   });
 
   it("blocks when the final check fails", async () => {

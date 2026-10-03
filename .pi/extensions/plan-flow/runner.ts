@@ -4,7 +4,7 @@
 // the feature stops as blocked. When every task is done it runs the final check, pushes and opens a PR.
 // Only this code writes the store and commits; workers just edit files.
 import { cpSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { PLAN_DIR, worktreePath, type RunnerConfig } from "./config.ts";
 import { addWorktree, branchExists, commitAll, git, headSha, resetHard, resetSoft, restorePath, shortShaForTrailer } from "./git.ts";
 import type { WorkerResult } from "./pi-worker.ts";
@@ -163,13 +163,13 @@ export async function runEpic(id: string, deps: RunnerDeps): Promise<RunEpicResu
   const logDir = join(deps.planRoot, "logs", id);
   const blocked = (reason: string, task?: string): RunEpicResult => {
     store.releaseEpic(id, "blocked");
-    log(`blocked: ${reason.split("\n")[0]}`);
     return { status: "blocked", reason, task };
   };
+  const rel = (p: string) => relative(deps.projectRoot, p); // log paths in the store, as for planner runs
 
   // A shell command recorded as a check run (task checks, setup, final check).
   const check = async (command: string, logName: string, task?: TaskRow) => {
-    const runId = store.startRun({ epic: id, role: "check", task: task?.id, attempt: task?.attempts, pid, logPath: join(logDir, logName) });
+    const runId = store.startRun({ epic: id, role: "check", task: task?.id, attempt: task?.attempts, pid, logPath: rel(join(logDir, logName)) });
     const r = await runCheck(command, { cwd: wt, timeoutMs: config.checkTimeoutMs, logPath: join(logDir, logName) });
     store.finishRun(runId, { outcome: r.code === 0 ? "success" : "error", exitCode: r.code });
     return r;
@@ -219,7 +219,7 @@ export async function runEpic(id: string, deps: RunnerDeps): Promise<RunEpicResu
       const name = `${task.id}-${task.attempts}`;
 
       const workerLog = join(logDir, `${name}-worker.jsonl`);
-      const runId = store.startRun({ epic: id, task: task.id, attempt: task.attempts, role: "worker", provider, model: config.model, pid, logPath: workerLog });
+      const runId = store.startRun({ epic: id, task: task.id, attempt: task.attempts, role: "worker", provider, model: config.model, pid, logPath: rel(workerLog) });
       const w = await deps.runWorker({
         cwd: wt, task: spec, attempt: task.attempts, prompt: workerPrompt(epic, spec, task.last_error), model: config.model,
         logPath: workerLog, timeoutMs: config.taskTimeoutMs,

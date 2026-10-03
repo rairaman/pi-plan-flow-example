@@ -529,7 +529,7 @@ export default function (pi: ExtensionAPI) {
         for (const r of s.runsFor(epic.id)) {
           const live = r.outcome === "running" ? Date.now() - r.started_at : r.duration_ms;
           rows.push([
-            `#${r.id}`, r.role, r.model ?? "?", r.outcome, fmtDuration(live), fmtTokens(r.input_tokens), fmtTokens(r.output_tokens),
+            `#${r.id}`, r.role, r.model ?? (r.role === "check" ? "-" : "?"), r.outcome, fmtDuration(live), fmtTokens(r.input_tokens), fmtTokens(r.output_tokens),
             `${fmtTokens(r.cache_read_tokens)}/${fmtTokens(r.cache_write_tokens)}`, String(r.turns ?? "-"), fmtCost(r.cost_usd), r.log_path ?? "",
           ]);
         }

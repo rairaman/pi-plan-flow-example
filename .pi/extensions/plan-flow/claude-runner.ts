@@ -1,6 +1,8 @@
 // Spawns Claude Code headless (`claude -p`) and parses its stream-json output.
 // No pi imports here so this file can be exercised standalone with `node`.
 import { spawn, type ChildProcess } from "node:child_process";
+import { createWriteStream, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 
 export interface ClaudeRunOptions {
   bin: string;
@@ -9,6 +11,14 @@ export interface ClaudeRunOptions {
   env: NodeJS.ProcessEnv;
   onStatus?: (text: string) => void;
   onProcess?: (child: ChildProcess) => void;
+  logPath?: string; // every stdout line is copied here (JSONL)
+}
+
+export interface TokenUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
 }
 
 export interface ClaudeRunResult {
@@ -20,7 +30,25 @@ export interface ClaudeRunResult {
   costUsd?: number;
   numTurns?: number;
   durationMs?: number;
+  apiDurationMs?: number;
+  usage?: TokenUsage;
   stderr: string;
+}
+
+function num(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) ? v : 0;
+}
+
+// The result event's usage uses Anthropic field names.
+export function parseUsage(u: unknown): TokenUsage | undefined {
+  if (typeof u !== "object" || u === null) return undefined;
+  const r = u as Record<string, unknown>;
+  return {
+    input: num(r.input_tokens),
+    output: num(r.output_tokens),
+    cacheRead: num(r.cache_read_input_tokens),
+    cacheWrite: num(r.cache_creation_input_tokens),
+  };
 }
 
 export function summarizeToolUse(name: string, input: unknown): string {
@@ -38,6 +66,11 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
       stdio: ["ignore", "pipe", "pipe"],
     });
     opts.onProcess?.(child);
+    let log: ReturnType<typeof createWriteStream> | undefined;
+    if (opts.logPath) {
+      mkdirSync(dirname(opts.logPath), { recursive: true });
+      log = createWriteStream(opts.logPath, { flags: "a" });
+    }
 
     const result: ClaudeRunResult = { code: null, resultText: "", isError: false, stderr: "" };
     let buf = "";
@@ -45,6 +78,7 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
 
     const handleLine = (line: string) => {
       if (!line.trim()) return;
+      log?.write(line + "\n");
       let ev: any;
       try {
         ev = JSON.parse(line);
@@ -73,6 +107,8 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
           result.costUsd = ev.total_cost_usd;
           result.numTurns = ev.num_turns;
           result.durationMs = ev.duration_ms;
+          result.apiDurationMs = ev.duration_api_ms;
+          result.usage = parseUsage(ev.usage);
           if (!result.sessionId) result.sessionId = ev.session_id;
           break;
       }
@@ -92,12 +128,16 @@ export function runClaude(opts: ClaudeRunOptions): Promise<ClaudeRunResult> {
       result.stderr += c;
       if (result.stderr.length > 20000) result.stderr = result.stderr.slice(-20000);
     });
-    child.on("error", reject);
+    child.on("error", (e) => {
+      log?.end();
+      reject(e);
+    });
     child.on("close", (code) => {
       if (buf.trim()) handleLine(buf);
       result.code = code;
       if (code !== 0 && !result.resultText) result.isError = true;
-      resolvePromise(result);
+      if (log) log.end(() => resolvePromise(result));
+      else resolvePromise(result);
     });
   });
 }

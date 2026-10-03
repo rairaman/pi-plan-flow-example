@@ -3,7 +3,8 @@
     "claudeBin": "claude",
     "model": "fable",
     "effort": "medium",
-    "maxBudgetUsd": 3
+    "maxBudgetUsd": 3,
+    "maxConcurrent": 2
   },
   "implementer": {
     "model": "lmstudio/qwen/qwen3.8-27b"

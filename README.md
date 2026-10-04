@@ -4,7 +4,8 @@ A two-model workflow for the [pi](https://pi.dev) coding agent, packaged as a pr
 
 - `/plan <feature>` asks Claude Code, running headless on your claude.ai subscription, to explore the repo and write a plan into its own folder, `.plan/<id>-<slug>/`: `plan.md` for you and `tasks.json` for the machine. Several plans can run at once.
 - `/plan-approve <id>` checks `tasks.json` and records the plan's tasks in `.plan/state.sqlite`.
-- `/implement <id>` switches pi to a cheap or local model and works through that plan task by task, ticking boxes as it goes.
+- `/run <id>` builds an approved plan unattended: its own git worktree, a fresh pi worker per task, the task's check run by the runner, a commit per passing task, then a pull request.
+- `/implement <id>` is the interactive alternative: pi switches to a cheap or local model and works through the plan in your session, ticking boxes as it goes.
 - `/plans` shows every plan with its status and the time, tokens and cost spent on it.
 
 You never switch models by hand. The expensive model plans, the cheap one types.
@@ -65,12 +66,33 @@ Review `plan.md`, then approve it:
 
 Approval checks `tasks.json`: required fields, task ids of the form `k3f9.1`, dependencies that exist and don't loop, and `after` entries that name real features without a cycle. Errors block approval. Warnings, such as two features in flight editing the same files, are shown but don't block. You can fix `tasks.json` by hand and run `/plan-approve` again.
 
-Then:
+Then build it, unattended:
+
+```
+/run k3f9                              # with implementer.model
+/run --model openai/gpt-5-mini k3f9    # a different worker model for this run
+```
+
+`/run` starts the runner as a background process and returns. The status line shows which task it is on. The runner keeps going if you quit pi. For each task, in dependency order:
+
+1. a fresh `pi --mode json` worker gets the task (instructions, files, `done_when`) and edits the worktree;
+2. the runner runs the task's `done_when` command itself;
+3. if it passes, the runner commits the work with a `Plan-Task: k3f9.3` trailer;
+4. if it fails, the runner throws the changes away and tries again with the error in the prompt. After `runner.maxAttempts` failures the plan stops as `blocked`.
+
+When every task is done it runs `runner.finalCheck`, pushes `factory/<id>-<slug>`, and opens a PR whose body lists each task's commit and the time, tokens and cost per role. It never merges. After a block, fix the cause (the code in the worktree, or `tasks.json`) and `/run k3f9` again to retry.
+
+The same runner works without pi, for scripts or cron:
+
+```bash
+node .pi/extensions/plan-flow/run.ts [--model <provider/model-id>] k3f9
+```
+
+To work through a plan in your own session instead:
 
 ```
 /implement                                    # picks the only plan, or offers a list
 /implement k3f9                               # a specific plan (the id, or the full folder name)
-/implement --model openai/gpt-5-mini k3f9     # a different implementer for this run
 /implement --model ? k3f9                     # pick from the models pi can use
 ```
 
@@ -80,8 +102,8 @@ Other commands:
 
 | Command | What it does |
 |---|---|
-| `/plans` | One line per plan: status, task count, runs, time, tokens in, out and cached, cost. |
-| `/plans k3f9` | Every run for that plan, with its model, outcome, time, tokens, turns, cost, and raw log file. |
+| `/plans` | One line per plan: status, tasks done, runs, time, tokens in, out and cached, cost. |
+| `/plans k3f9` | Every run for that plan (planner, each worker attempt, each check), with its model, outcome, time, tokens, turns, cost, and log file. |
 | `/plan-cancel [id]` | Stops a running plan. With several running and no id, you pick one. Partial files stay in the plan's folder. |
 
 Leaving pi, `/new` and `/reload` cancel any plans still running, because nothing is left to record their results.
@@ -93,9 +115,13 @@ Leaving pi, `/new` and `/reload` cancel any plans still running, because nothing
   k3f9-csv-export-button-reports/
     plan.md       Goal, context, a checklist of tasks, notes. For you.
     tasks.json    The same tasks with files, dependencies, instructions and a done_when command.
+  worktrees/
+    k3f9-csv-export-button-reports/   The runner's git worktree on factory/k3f9-... (gitignored)
   state.sqlite    Plans, tasks and every run (gitignored)
-  logs/k3f9/      Raw Claude output for each run, as JSONL (gitignored)
+  logs/k3f9/      Planner and worker output (JSONL), check output, runner.log (gitignored)
 ```
+
+When the runner starts a plan it moves the plan folder into the worktree and commits it as the branch's first commit, so the plan travels with the PR.
 
 Plan folders are not ignored by git: review them and commit them with the work. `docs/example-plan.md` shows a generated pair.
 
@@ -110,7 +136,7 @@ sqlite3 -header -column .plan/state.sqlite \
   "select epic, role, model, outcome, duration_ms, input_tokens, output_tokens, cache_read_tokens, cost_usd from runs order by id"
 ```
 
-The `runs` table gets one row per planner run, with start and end times, API time, token counts, turns, Claude's cost estimate, outcome, session id and log path.
+The `runs` table gets one row per planner run, worker attempt and check, with start and end times, token counts, turns, cost, outcome, exit code and log path. Questions it answers: which tasks needed retries, how long checks take, and tokens per second or pass rate per worker model.
 
 ## Configuration
 
@@ -124,7 +150,15 @@ The `runs` table gets one row per planner run, with start and end times, API tim
 | `planner.effort` | Default effort. `medium` if unset. |
 | `planner.maxBudgetUsd` | Default budget cap. Omit for none. |
 | `planner.maxConcurrent` | How many plans may run at once. Default 2. Each is a separate `claude -p` against your subscription's limits. |
-| `implementer.model` | `provider/model-id` pi switches to for `/implement`. `"?"` asks every time. |
+| `implementer.model` | `provider/model-id` for `/run` workers and `/implement`. For `/implement`, `"?"` asks every time. |
+| `runner.baseBranch` | Branch feature branches start from, and the PR target. Default `main`. |
+| `runner.maxAttempts` | Attempts per task before the plan is blocked. Default 2. |
+| `runner.taskTimeoutMinutes` | Time limit per worker run. Default 20. |
+| `runner.checkTimeoutMinutes` | Time limit per check (`done_when`, setup, final check). Default 10. |
+| `runner.setup` | Command run once in a new worktree, such as `npm ci`. |
+| `runner.finalCheck` | Command run after every task passes, such as `npm run check`. |
+| `runner.openPr` | Push and open a PR at the end. Default `true`; with `false` the branch is left ready locally. |
+| `runner.piBin` | Path or name of the `pi` binary for workers. Default `pi`. |
 | `providers` | Extra providers for pi, same shape as `~/.pi/agent/models.json`. Registered at startup so cloners need no global config. |
 
 `.pi/settings.json` sets the model pi starts on. Keep it in line with `implementer.model`.
@@ -156,17 +190,25 @@ The `runs` table gets one row per planner run, with start and end times, API tim
 5. `claude-runner.ts` parses that stream: tool calls become the status line, and the final result gives the summary, session id, tokens and cost. Every line is also written to the run's log file.
 6. When Claude exits, the run's numbers are saved and `tasks.json` is validated. A valid plan becomes `draft`; one with errors becomes `failed`.
 7. `/plan-approve` re-validates, then loads the tasks and dependencies into the store and marks the plan `approved`.
-8. `/implement` switches pi to the implementer model if needed and sends `/implement-prompt <folder>`. That prompt tells the model to read `plan.md` and `tasks.json`, do the tasks in order, run each `done_when` command, and tick the box in `plan.md`.
+8. `/run` spawns `run.ts`, which locks the plan, creates the worktree, and loops: claim the next ready task, run a worker (`pi --mode json --approve --no-session`, with `worker-instructions.md` appended to its system prompt), run `done_when`, then commit or reset. Workers never commit: if one does, the runner keeps its changes and drops the commit, and it undoes any edit under `.plan/`.
+9. `/implement` switches pi to the implementer model if needed and sends `/implement-prompt <folder>`. That prompt tells the model to read `plan.md` and `tasks.json`, do the tasks in order, run each `done_when` command, and tick the box in `plan.md`.
 
 The module layout:
 
 | File | Purpose |
 |---|---|
-| `index.ts` | Commands, config, background plan runs. |
+| `index.ts` | Commands and background plan runs. |
+| `config.ts` | Paths and `plan.json` loading, shared with the runner. |
+| `runner.ts` | The runner loop: worktree, tasks, checks, commits, PR. |
+| `run.ts` | Command-line entry point for the runner. |
+| `pi-worker.ts` | Spawns a headless pi worker and adds up its token use. |
+| `shell-check.ts` | Runs a check command with a timeout. |
+| `git.ts` | The git commands the runner uses. |
 | `claude-runner.ts` | Spawns `claude -p` and parses its output. No pi imports. |
 | `ids.ts` | Plan ids, slugs, folder and branch names. |
 | `tasks-file.ts` | The `tasks.json` format and its validation. |
 | `store.ts` | `.plan/state.sqlite`, using Node's built-in `node:sqlite`. |
+| `worker-instructions.md` | Rules appended to every worker's system prompt. |
 
 ## Developing the extension
 
@@ -174,6 +216,6 @@ The module layout:
 
 ## Using this in your own project
 
-Copy `.pi/` and the `.gitignore` lines for `.plan/state.sqlite*`, `.plan/logs/` and `.pi/plan.local.json` into your repo. Node 22.13 or later is needed for `node:sqlite`. Everything else here is documentation or dev tooling.
+Copy `.pi/` and the `.gitignore` lines for `.plan/state.sqlite*`, `.plan/logs/`, `.plan/worktrees/` and `.pi/plan.local.json` into your repo. Set `runner.setup` and `runner.finalCheck` for your project, or remove them. Node 22.13 or later is needed for `node:sqlite`. Everything else here is documentation or dev tooling.
 
 Plans made before plan ids existed (`.plan/<slug>.md`) are no longer listed by `/implement`.

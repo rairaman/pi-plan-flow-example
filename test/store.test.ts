@@ -1,9 +1,10 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { openStore, type Store } from "../.pi/extensions/plan-flow/store";
-import type { TasksFile } from "../.pi/extensions/plan-flow/tasks-file";
+import { openStore, type Store } from "../.pi/extensions/plan-flow/store.ts";
+import type { TasksFile } from "../.pi/extensions/plan-flow/tasks-file.ts";
 
 let clock = 1_000;
 const now = () => clock;
@@ -45,7 +46,7 @@ describe("openStore", () => {
       a.close();
       const b = store(path);
       expect(b.epic("k3f9")?.status).toBe("planning");
-      expect((b.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(1);
+      expect((b.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(2);
       expect((b.db.prepare("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode).toBe("wal");
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -198,5 +199,123 @@ describe("epicSummaries", () => {
       id: "k3f9", run_count: 2, duration_ms: 1_500, input_tokens: 11, output_tokens: 5, cache_read_tokens: 100, cache_write_tokens: 20,
     });
     expect(k3f9.cost_usd).toBeCloseTo(0.15);
+  });
+});
+
+describe("schema v2 migration", () => {
+  it("upgrades a v1 database in place and keeps its data", () => {
+    const dir = mkdtempSync(join(tmpdir(), "plan-store-"));
+    try {
+      const path = join(dir, "state.sqlite");
+      // Build a v1 database by hand: the v1 schema without the runner columns.
+      const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
+      const raw = new DatabaseSync(path);
+      raw.exec(`CREATE TABLE epics (id TEXT PRIMARY KEY, slug TEXT NOT NULL, title TEXT, dir TEXT NOT NULL, branch TEXT NOT NULL,
+        request TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+        INSERT INTO epics VALUES ('old1', 's', NULL, 'old1-s', 'factory/old1-s', 'r', 'draft', 1, 1);
+        PRAGMA user_version = 1;`);
+      raw.close();
+      const s = store(path);
+      expect(s.epic("old1")).toMatchObject({ status: "draft", runner_pid: null, pr_url: null });
+      expect((s.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("runner", () => {
+  // k3f9.1 and k3f9.3 have no deps; k3f9.2 waits for k3f9.1.
+  function approved(s: Store) {
+    addEpic(s);
+    s.setEpicStatus("k3f9", "draft");
+    s.importTasks({
+      ...tasksFile,
+      after: [],
+      tasks: [
+        tasksFile.tasks[0],
+        tasksFile.tasks[1],
+        { id: "k3f9.3", title: "docs", files: [], depends_on: [], instructions: "x", done_when: "true" },
+      ],
+    });
+  }
+
+  it("locks a feature once and frees it when released", () => {
+    const s = store();
+    approved(s);
+    expect(s.lockEpic("k3f9", 100, () => true)).toEqual({ ok: true });
+    expect(s.epic("k3f9")).toMatchObject({ status: "running", runner_pid: 100 });
+    const second = s.lockEpic("k3f9", 200, () => true);
+    expect(second.ok).toBe(false);
+    expect(!second.ok && second.reason).toMatch(/already running \(pid 100\)/);
+    s.releaseEpic("k3f9", "blocked");
+    expect(s.epic("k3f9")).toMatchObject({ status: "blocked", runner_pid: null });
+    expect(s.lockEpic("k3f9", 200, () => true)).toEqual({ ok: true });
+  });
+
+  it("takes over a feature whose runner died, and refuses drafts", () => {
+    const s = store();
+    approved(s);
+    s.lockEpic("k3f9", 100, () => true);
+    expect(s.lockEpic("k3f9", 200, (pid) => pid !== 100)).toEqual({ ok: true });
+    addEpic(s, "m2p1");
+    s.setEpicStatus("m2p1", "draft");
+    const r = s.lockEpic("m2p1", 1, () => true);
+    expect(!r.ok && r.reason).toMatch(/draft; only approved or blocked/);
+  });
+
+  it("claims ready tasks in order and respects dependencies", () => {
+    const s = store();
+    approved(s);
+    const first = s.claimNextTask("k3f9", 7)!;
+    expect(first).toMatchObject({ id: "k3f9.1", status: "claimed", attempts: 1, claimed_by: "pid:7" });
+    // k3f9.2 waits for k3f9.1, so k3f9.3 is next.
+    expect(s.claimNextTask("k3f9", 7)!.id).toBe("k3f9.3");
+    expect(s.claimNextTask("k3f9", 7)).toBeUndefined();
+    s.completeTask("k3f9.1");
+    expect(s.claimNextTask("k3f9", 7)!.id).toBe("k3f9.2");
+    expect(s.taskProgress("k3f9")).toEqual({ done: 1, total: 3 });
+  });
+
+  it("retries a failed task until it runs out of attempts", () => {
+    const s = store();
+    approved(s);
+    s.claimNextTask("k3f9");
+    expect(s.failTask("k3f9.1", "boom 1", 2)).toBe("open");
+    expect(s.claimNextTask("k3f9")!).toMatchObject({ id: "k3f9.1", attempts: 2, last_error: "boom 1" });
+    expect(s.failTask("k3f9.1", "boom 2", 2)).toBe("needs_replan");
+    expect(s.task("k3f9.1")).toMatchObject({ status: "needs_replan", last_error: "boom 2", claimed_by: null });
+    expect(s.resetBlockedTasks("k3f9")).toEqual(["k3f9.1"]);
+    expect(s.task("k3f9.1")).toMatchObject({ status: "open", attempts: 0, last_error: "boom 2" });
+  });
+
+  it("completing a task clears its error", () => {
+    const s = store();
+    approved(s);
+    s.claimNextTask("k3f9");
+    s.failTask("k3f9.1", "boom", 2);
+    s.claimNextTask("k3f9");
+    s.completeTask("k3f9.1");
+    expect(s.task("k3f9.1")).toMatchObject({ status: "done", last_error: null, claimed_by: null });
+  });
+
+  it("resets claims left by a dead runner without counting the attempt", () => {
+    const s = store();
+    approved(s);
+    s.claimNextTask("k3f9", 100);
+    s.claimNextTask("k3f9", 200);
+    expect(s.resetDeadClaims("k3f9", (pid) => pid === 200)).toEqual(["k3f9.1"]);
+    expect(s.task("k3f9.1")).toMatchObject({ status: "open", attempts: 0, claimed_by: null });
+    expect(s.task("k3f9.3")!.status).toBe("claimed");
+  });
+
+  it("records the PR and counts done tasks in summaries", () => {
+    const s = store();
+    approved(s);
+    s.claimNextTask("k3f9");
+    s.completeTask("k3f9.1");
+    s.setPrUrl("k3f9", "https://example.com/pr/1");
+    expect(s.epic("k3f9")!.pr_url).toBe("https://example.com/pr/1");
+    expect(s.epicSummaries()[0]).toMatchObject({ task_count: 3, tasks_done: 1 });
   });
 });

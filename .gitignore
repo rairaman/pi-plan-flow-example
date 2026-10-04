@@ -1,6 +1,7 @@
 # plan folders (.plan/<id>-<slug>/) are reviewed and committed; the runner's state and raw logs are not
 .plan/state.sqlite*
 .plan/logs/
+.plan/worktrees/
 # per-machine overrides (Claude login profile, local model, binary path)
 .pi/plan.local.json
 node_modules/

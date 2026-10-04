@@ -2,30 +2,25 @@
 //   /plan <request>    Claude Code headless (`claude -p`, billed to your claude.ai subscription) explores
 //                      the repo and writes .plan/<id>-<slug>/plan.md + tasks.json. Several can run at once.
 //   /plan-approve <id> validates tasks.json and loads its tasks into .plan/state.sqlite
+//   /run <id>          runs an approved plan unattended in its own worktree (run.ts) and opens a PR
 //   /plans [id]        features, their status, and the time, tokens and cost of every run
-//   /implement <id>    pi switches to the configured (usually local) model and works through the plan
+//   /implement <id>    interactive alternative to /run: pi switches models and works through the plan
 //
 // Lives in <project>/.pi/extensions/plan-flow/. Config: <project>/.pi/plan.json, with
 // <project>/.pi/plan.local.json (gitignored) merged over it for per-machine overrides.
-import type { ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
-import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { spawn, type ChildProcess } from "node:child_process";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { runClaude, type ClaudeRunResult } from "./claude-runner";
-import { branchFor, idFromArg, newId, planDirName, slugify } from "./ids";
-import { ACTIVE_STATUSES, openStore, type EpicRow, type EpicStatus, type Store } from "./store";
-import { parseTasksFile, validateTasksFile, type OtherEpic, type TasksFile, type Validation } from "./tasks-file";
+import { runClaude, type ClaudeRunResult } from "./claude-runner.ts";
+import {
+  EXT_DIR, PLAN_DIR, PLAN_ROOT, PROJECT_ROOT, STORE_PATH, expandHome, loadConfig, planFolder,
+  type PlanConfig, type PlannerConfig,
+} from "./config.ts";
+import { branchFor, idFromArg, newId, planDirName, slugify } from "./ids.ts";
+import { ACTIVE_STATUSES, openStore, type EpicRow, type EpicStatus, type Store } from "./store.ts";
+import { parseTasksFile, validateTasksFile, type OtherEpic, type TasksFile, type Validation } from "./tasks-file.ts";
 
-const PLAN_DIR = ".plan";
-const EXT_DIR = dirname(fileURLToPath(import.meta.url));
-// <project>/.pi when installed as a project-local extension; fall back to cwd otherwise.
-const PI_DIR = basename(resolve(EXT_DIR, "..", "..")) === ".pi" ? resolve(EXT_DIR, "..", "..") : join(process.cwd(), ".pi");
-const PROJECT_ROOT = dirname(PI_DIR);
-const PLAN_ROOT = join(PROJECT_ROOT, PLAN_DIR);
-const STORE_PATH = join(PLAN_ROOT, "state.sqlite");
-const CONFIG_FILES = ["plan.json", "plan.local.json"]; // later files override earlier ones
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
 const DEFAULT_EFFORT = "medium";
 const DEFAULT_MAX_CONCURRENT = 2;
@@ -36,21 +31,6 @@ const CLAUDE_MODELS = ["fable", "opus", "sonnet", "haiku"]; // Claude Code alias
 const PLANNER_READ_TOOLS = ["Read", "Grep", "Glob", "Bash(git log:*)", "Bash(git show:*)", "Bash(git diff:*)", "Bash(git status:*)", "Bash(ls:*)"];
 const IMPLEMENTABLE: EpicStatus[] = ["draft", "approved"];
 
-interface PlannerConfig {
-  claudeBin?: string; // default "claude", resolved on PATH
-  claudeConfigDir?: string; // CLAUDE_CONFIG_DIR for the spawned claude; unset = claude's default (~/.claude)
-  model?: string; // claude --model
-  effort?: string; // claude --effort low|medium|high|xhigh|max
-  maxBudgetUsd?: number; // claude --max-budget-usd, a hard stop based on Claude's own cost estimate
-  maxConcurrent?: number; // plans that may run at once
-}
-
-interface PlanConfig {
-  planner?: PlannerConfig;
-  implementer?: { model?: string }; // "provider/model-id" that pi switches to for /implement
-  providers?: Record<string, any>; // same shape as ~/.pi/agent/models.json providers; registered at startup
-}
-
 // A /plan run in flight. Removed from the map when Claude exits.
 interface PlanRun {
   id: string;
@@ -60,35 +40,6 @@ interface PlanRun {
   startedAt: number;
   child?: ChildProcess;
   cancelled: boolean;
-}
-
-function expandHome(p: string): string {
-  return p === "~" || p.startsWith("~/") ? join(homedir(), p.slice(1)) : p;
-}
-
-function isObject(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
-
-function deepMerge(base: unknown, over: unknown): unknown {
-  if (!isObject(base) || !isObject(over)) return over;
-  const out: Record<string, unknown> = { ...base };
-  for (const [k, v] of Object.entries(over)) out[k] = k in out ? deepMerge(out[k], v) : v;
-  return out;
-}
-
-function loadConfig(): PlanConfig {
-  let cfg: unknown = {};
-  for (const name of CONFIG_FILES) {
-    const p = join(PI_DIR, name);
-    if (!existsSync(p)) continue;
-    try {
-      cfg = deepMerge(cfg, JSON.parse(readFileSync(p, "utf8")));
-    } catch (e) {
-      throw new Error(`Invalid JSON in ${p}: ${(e as Error).message}`);
-    }
-  }
-  return cfg as PlanConfig;
 }
 
 function registerProviders(pi: ExtensionAPI, cfg: PlanConfig): void {
@@ -153,7 +104,7 @@ function readIfExists(p: string): string | undefined {
 }
 
 function readTasksFile(dirName: string): { file?: TasksFile; errors: string[] } {
-  const text = readIfExists(join(PLAN_ROOT, dirName, "tasks.json"));
+  const text = readIfExists(join(planFolder(dirName), "tasks.json"));
   if (text === undefined) return { errors: [`${PLAN_DIR}/${dirName}/tasks.json was not written`] };
   return parseTasksFile(text);
 }
@@ -178,7 +129,7 @@ function otherEpics(store: Store, exceptId: string): OtherEpic[] {
 function validatePlan(store: Store, epic: EpicRow): { file?: TasksFile } & Validation {
   const parsed = readTasksFile(epic.dir);
   if (!parsed.file) return { errors: parsed.errors, warnings: [] };
-  const planMd = readIfExists(join(PLAN_ROOT, epic.dir, "plan.md"));
+  const planMd = readIfExists(join(planFolder(epic.dir), "plan.md"));
   const v = validateTasksFile(parsed.file, { dirName: epic.dir, others: otherEpics(store, epic.id), planMd });
   if (planMd === undefined) v.errors.push(`${PLAN_DIR}/${epic.dir}/plan.md was not written`);
   return { file: parsed.file, ...v };
@@ -232,6 +183,7 @@ function table(rows: string[][]): string {
 
 export default function (pi: ExtensionAPI) {
   const runs = new Map<string, PlanRun>();
+  const runners = new Map<string, { child: ChildProcess; poll: NodeJS.Timeout }>(); // /run processes started here
   let ui: ExtensionContext["ui"] | undefined; // latest UI, for runs that finish after their command returned
   let store: Store | undefined;
   let disposed = false; // set on session_shutdown; late callbacks from this runtime then do nothing
@@ -365,6 +317,9 @@ export default function (pi: ExtensionAPI) {
       store?.setEpicStatus(run.id, "cancelled");
     }
     runs.clear();
+    // Runners are separate processes and keep going; this runtime just stops watching them.
+    for (const r of runners.values()) clearInterval(r.poll);
+    runners.clear();
     store?.close();
     store = undefined;
   });
@@ -574,7 +529,7 @@ export default function (pi: ExtensionAPI) {
         for (const r of s.runsFor(epic.id)) {
           const live = r.outcome === "running" ? Date.now() - r.started_at : r.duration_ms;
           rows.push([
-            `#${r.id}`, r.role, r.model ?? "?", r.outcome, fmtDuration(live), fmtTokens(r.input_tokens), fmtTokens(r.output_tokens),
+            `#${r.id}`, r.role, r.model ?? (r.role === "check" ? "-" : "?"), r.outcome, fmtDuration(live), fmtTokens(r.input_tokens), fmtTokens(r.output_tokens),
             `${fmtTokens(r.cache_read_tokens)}/${fmtTokens(r.cache_write_tokens)}`, String(r.turns ?? "-"), fmtCost(r.cost_usd), r.log_path ?? "",
           ]);
         }
@@ -590,13 +545,83 @@ export default function (pi: ExtensionAPI) {
       for (const e of summaries) {
         // Approved plans have tasks in the store; drafts only in their tasks.json.
         const taskCount = e.task_count || (s.epic(e.id) && readTasksFile(s.epic(e.id)!.dir).file?.tasks.length) || 0;
+        const tasks = !taskCount ? "-" : e.task_count ? `${e.tasks_done}/${e.task_count}` : String(taskCount);
         rows.push([
-          e.id, runs.has(e.id) ? "planning*" : e.status, taskCount ? String(taskCount) : "-", String(e.run_count), fmtDuration(e.duration_ms),
+          e.id, runs.has(e.id) ? "planning*" : e.status, tasks, String(e.run_count), fmtDuration(e.duration_ms),
           fmtTokens(e.input_tokens), fmtTokens(e.output_tokens), fmtTokens(e.cache_read_tokens + e.cache_write_tokens), fmtCost(e.cost_usd), e.slug,
         ]);
       }
       const footnote = runs.size ? "\n* running now; time and tokens count finished runs only" : "";
       ctx.ui.notify(`${table(rows)}${footnote}`, "info");
+    },
+  });
+
+  pi.registerCommand("run", {
+    description: "Run an approved plan unattended: its own worktree, a worker per task, checks, commits, then a PR (flags: --model <provider/id>)",
+    handler: async (args: string, ctx: ExtensionCommandContext) => {
+      ui = ctx.ui;
+      let s: Store;
+      let model: string;
+      let planArg: string;
+      let modelFlag: string | undefined;
+      try {
+        const { flags, rest } = parseFlags(args, ["--model"]);
+        planArg = rest;
+        modelFlag = flags["--model"];
+        model = modelFlag ?? loadConfig().implementer?.model ?? "";
+        if (!model.includes("/")) throw new Error('The runner needs a worker model as "provider/model-id": set implementer.model in .pi/plan.json or pass --model.');
+        s = getStore();
+      } catch (e) {
+        ctx.ui.notify((e as Error).message, "error");
+        return;
+      }
+      const epic = await chooseEpic(planArg, ctx, ["approved", "blocked"], "run");
+      if (!epic) return;
+      if (runners.has(epic.id)) {
+        ctx.ui.notify(`${epic.dir} is already running. /plans ${epic.id} shows progress.`, "warning");
+        return;
+      }
+      if (epic.status !== "approved" && epic.status !== "blocked") {
+        ctx.ui.notify(`${epic.dir} is ${epic.status}; /run takes approved or blocked plans.`, "error");
+        return;
+      }
+
+      const logRel = `${PLAN_DIR}/logs/${epic.id}/runner.log`;
+      mkdirSync(join(PLAN_ROOT, "logs", epic.id), { recursive: true });
+      const fd = openSync(join(PROJECT_ROOT, logRel), "a");
+      const child = spawn(process.execPath, [join(EXT_DIR, "run.ts"), ...(modelFlag ? ["--model", modelFlag] : []), epic.id], {
+        cwd: PROJECT_ROOT,
+        detached: true, // keeps running if pi quits
+        stdio: ["ignore", fd, fd],
+      });
+      closeSync(fd);
+      child.unref();
+
+      const label = epic.dir.slice(0, 28);
+      const poll = setInterval(() => {
+        if (disposed) return;
+        const { done, total } = s.taskProgress(epic.id);
+        const current = s.tasks(epic.id).find((t) => t.status === "claimed");
+        ui?.setStatus(`plan-flow:run:${epic.id}`, `${label}: ${current ? `task ${done + 1}/${total} (${current.id}, attempt ${current.attempts})` : `${done}/${total} tasks done`}`);
+      }, 3000);
+      runners.set(epic.id, { child, poll });
+      child.on("exit", (code) => {
+        clearInterval(poll);
+        runners.delete(epic.id);
+        if (disposed) return;
+        ui?.setStatus(`plan-flow:run:${epic.id}`, undefined);
+        const e = s.epic(epic.id);
+        if (e?.status === "in_review") {
+          notify(e.pr_url ? `${epic.dir} is ready for review: ${e.pr_url}` : `${epic.dir}: all tasks done, ${epic.branch} is ready.`, "info");
+        } else if (e?.status === "blocked") {
+          const stuck = s.tasks(epic.id).find((t) => t.status === "needs_replan");
+          const why = stuck ? `${stuck.id} (${stuck.title}) failed ${stuck.attempts} times:\n${(stuck.last_error ?? "").slice(0, 600)}` : `see ${logRel}`;
+          notify(`${epic.dir} is blocked. ${why}\nFix it, then /run ${epic.id} to retry.`, "error");
+        } else {
+          notify(`Runner for ${epic.dir} exited (code ${code}). See ${logRel}.`, code === 0 ? "info" : "error");
+        }
+      });
+      ctx.ui.notify(`Running ${epic.dir} with ${model} in ${PLAN_DIR}/worktrees/${epic.dir}/. Log: ${logRel}. It keeps going if you quit pi; /plans ${epic.id} shows every run.`, "info");
     },
   });
 

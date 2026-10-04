@@ -6,7 +6,16 @@
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
-    "types": ["node"]
+    "types": [
+      "node"
+    ],
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true
   },
-  "include": [".pi/extensions/**/*.ts", "test/**/*.ts"]
+  "include": [
+    ".pi/extensions/**/*.ts",
+    "test/**/*.ts",
+    "vitest.config.ts"
+  ]
 }

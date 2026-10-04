@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { findCycle, parseTasksFile, validateTasksFile, type OtherEpic, type TasksFile } from "../.pi/extensions/plan-flow/tasks-file";
+import { findCycle, parseTasksFile, validateTasksFile, type OtherEpic, type TasksFile } from "../.pi/extensions/plan-flow/tasks-file.ts";
 
 const DIR = "k3f9-sched-email";
 

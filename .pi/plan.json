@@ -9,14 +9,35 @@
   "implementer": {
     "model": "lmstudio/qwen/qwen3.8-27b"
   },
+  "runner": {
+    "baseBranch": "main",
+    "maxAttempts": 2,
+    "taskTimeoutMinutes": 20,
+    "checkTimeoutMinutes": 10,
+    "setup": "npm ci",
+    "finalCheck": "npm run check",
+    "openPr": true
+  },
   "providers": {
     "lmstudio": {
       "baseUrl": "http://127.0.0.1:1234/v1",
       "api": "openai-completions",
       "apiKey": "lmstudio",
-      "compat": { "supportsDeveloperRole": false, "supportsReasoningEffort": false },
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false
+      },
       "models": [
-        { "id": "qwen/qwen3.8-27b", "name": "qwen-local", "input": ["text", "image"], "contextWindow": 262144, "maxTokens": 32768 }
+        {
+          "id": "qwen/qwen3.8-27b",
+          "name": "qwen-local",
+          "input": [
+            "text",
+            "image"
+          ],
+          "contextWindow": 262144,
+          "maxTokens": 32768
+        }
       ]
     }
   }

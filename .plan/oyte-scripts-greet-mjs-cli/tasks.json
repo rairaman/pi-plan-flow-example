@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "epic": "oyte",
+  "title": "Add greet.mjs CLI script with vitest tests",
+  "branch": "factory/oyte-scripts-greet-mjs-cli",
+  "after": [],
+  "tasks": [
+    {
+      "id": "oyte.1",
+      "title": "Create scripts/greet.mjs CLI script",
+      "files": ["scripts/greet.mjs"],
+      "depends_on": [],
+      "instructions": "Create the file scripts/greet.mjs with a Node.js CLI script that:\n1. Reads the first CLI argument via process.argv[2]\n2. Defaults to 'world' if no argument provided\n3. Prints 'Hello, <name>!' to stdout (with newline)\n\nExample behavior:\n- `node scripts/greet.mjs` outputs: Hello, world!\n- `node scripts/greet.mjs Alice` outputs: Hello, Alice!\n\nUse a simple 2-3 line implementation with console.log().",
+      "done_when": "node scripts/greet.mjs | grep -q 'Hello, world' && node scripts/greet.mjs Bob | grep -q 'Hello, Bob'"
+    },
+    {
+      "id": "oyte.2",
+      "title": "Create test/greet.test.ts vitest test",
+      "files": ["test/greet.test.ts"],
+      "depends_on": ["oyte.1"],
+      "instructions": "Create test/greet.test.ts with vitest tests that:\n1. Import { describe, expect, it } from 'vitest'\n2. Import { spawn } from 'node:child_process' to run the script\n3. Create a test that runs 'node scripts/greet.mjs' with no arguments and checks output contains 'Hello, world!'\n4. Create a test that runs 'node scripts/greet.mjs' with argument 'Alice' and checks output contains 'Hello, Alice!'\n\nPattern: use spawn or execSync to run the command, capture stdout, and assert with expect().\nSee test/shell-check.test.ts for examples of running shell commands in vitest.",
+      "done_when": "npm test -- test/greet.test.ts"
+    }
+  ]
+}

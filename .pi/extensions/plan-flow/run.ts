@@ -45,6 +45,8 @@ async function main(argv: string[]): Promise<number> {
   const store = openStore(STORE_PATH);
   try {
     log(`runner pid ${process.pid}: plan ${id} with ${model}`);
+    const recovered = store.recoverInterrupted(); // runs left "running" by processes that died
+    if (recovered.runs) log(`marked ${recovered.runs} interrupted run(s) abandoned`);
     const result = await runEpic(id, {
       store,
       projectRoot: PROJECT_ROOT,
